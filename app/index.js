@@ -15,6 +15,8 @@ const IMMICH_API_KEY = process.env.IMMICH_API_KEY;
 const UPLOAD_CONCURRENCY = parseInt(process.env.UPLOAD_CONCURRENCY || '3', 10);
 const DEVICE_ID = process.env.DEVICE_ID || 'k8s-takeout-streamer';
 const TMP_DIR = process.env.TMP_DIR || '/work/tmp';
+const MAX_STAGED_FILES = parseInt(process.env.MAX_STAGED_FILES || '15', 10);
+const MAX_STAGED_BYTES = parseInt(process.env.MAX_STAGED_BYTES || (10 * 1024 * 1024 * 1024).toString(), 10);
 
 const app = express();
 
@@ -35,20 +37,41 @@ app.post('/upload-archive', async (req, res) => {
   const extractor = extract();
   const gunzip = createGunzip();
 
+  let stagedFilesCount = 0;
+  let stagedFilesBytes = 0;
+
   extractor.on('entry', async (header, stream, next) => {
     if (header.type !== 'file') {
       stream.resume();
       return next();
     }
 
-    // Backpressure: if we have too many pending uploads, wait before processing the next entry
-    if (limit.pendingCount >= UPLOAD_CONCURRENCY * 2) {
-      log({ message: 'Backpressure: waiting for queue to drain', pending: limit.pendingCount });
-      // We can use a simple poll or a more elegant event-based approach
-      while (limit.pendingCount >= UPLOAD_CONCURRENCY) {
-        await new Promise(resolve => setTimeout(resolve, 100));
+    // Strict Predictive Backpressure
+    const fileSize = header.size || 0;
+
+    const shouldWait = () => {
+      return stagedFilesCount >= MAX_STAGED_FILES ||
+             (stagedFilesBytes + fileSize) > MAX_STAGED_BYTES ||
+             limit.pendingCount >= UPLOAD_CONCURRENCY * 2;
+    };
+
+    if (shouldWait()) {
+      log({
+        message: 'Backpressure: waiting for resources',
+        stagedCount: stagedFilesCount,
+        stagedBytes: stagedFilesBytes,
+        nextFileSize: fileSize,
+        pendingUploads: limit.pendingCount
+      });
+
+      while (shouldWait()) {
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
+
+    // Commit to staging this file
+    stagedFilesCount++;
+    stagedFilesBytes += fileSize;
 
     const fileExtension = path.extname(header.name);
     const tmpFileName = `${crypto.randomUUID()}${fileExtension}`;
@@ -68,7 +91,8 @@ app.post('/upload-archive', async (req, res) => {
         let attempt = 0;
         const maxAttempts = 3;
 
-        while (attempt < maxAttempts) {
+        try {
+          while (attempt < maxAttempts) {
           attempt++;
           try {
             const fileBlob = await openAsBlob(tmpPath);
@@ -108,16 +132,21 @@ app.post('/upload-archive', async (req, res) => {
               await new Promise(resolve => setTimeout(resolve, delay));
             }
           }
+          }
+        } finally {
+          // ALWAYS clean up to prevent emptyDir exhaustion
+          await unlink(tmpPath).catch(() => {});
+          stagedFilesCount--;
+          stagedFilesBytes -= fileSize;
         }
-      }).finally(async () => {
-        // ALWAYS clean up to prevent emptyDir exhaustion
-        await unlink(tmpPath).catch(() => {});
       });
 
       next();
     } catch (err) {
       log({ error: 'Staging failed', name: header.name, detail: err.message });
       await unlink(tmpPath).catch(() => {});
+      stagedFilesCount--;
+      stagedFilesBytes -= fileSize;
       next();
     }
   });

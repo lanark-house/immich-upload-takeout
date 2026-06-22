@@ -30,6 +30,10 @@ spec:
           value: "3"
         - name: DEVICE_ID
           value: "k8s-takeout-streamer"
+        - name: MAX_STAGED_FILES
+          value: "15"
+        - name: MAX_STAGED_BYTES
+          value: "10737418240" # 10Gi
         resources:
           requests:
             memory: "256Mi"

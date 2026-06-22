@@ -60,3 +60,5 @@ The service can be configured via environment variables:
 | `DEVICE_ID` | `k8s-takeout-streamer` | Device ID reported to Immich |
 | `PORT` | `3000` | Port the service listens on |
 | `TMP_DIR` | `/work/tmp` | Directory for staging files |
+| `MAX_STAGED_FILES` | `15` | Max files staged at any time |
+| `MAX_STAGED_BYTES` | `10737418240` (10Gi) | Max bytes staged at any time |
