@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: immich-takeout-streamer
+  namespace: immich
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: immich-takeout-streamer
+  template:
+    metadata:
+      labels:
+        app: immich-takeout-streamer
+    spec:
+      containers:
+      - name: streamer
+        image: ghcr.io/your-username/immich-takeout-streamer:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: IMMICH_API_URL
+          value: "http://immich-server.immich.svc.cluster.local:2283/api/assets"
+        - name: IMMICH_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: immich-takeout-streamer-secret
+              key: IMMICH_API_KEY
+        - name: UPLOAD_CONCURRENCY
+          value: "3"
+        - name: DEVICE_ID
+          value: "k8s-takeout-streamer"
+        - name: MAX_STAGED_FILES
+          value: "15"
+        - name: MAX_STAGED_BYTES
+          value: "10737418240" # 10Gi
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: work-tmp
+          mountPath: /work/tmp
+      volumes:
+      - name: work-tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 512Mi
