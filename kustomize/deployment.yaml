@@ -36,11 +36,11 @@ spec:
           value: "10737418240" # 10Gi
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "128Mi"
+            cpu: "100m"
           limits:
-            memory: "1Gi"
-            cpu: "1000m"
+            memory: "512Mi"
+            cpu: "500m"
         volumeMounts:
         - name: work-tmp
           mountPath: /work/tmp

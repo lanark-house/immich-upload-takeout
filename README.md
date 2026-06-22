@@ -8,7 +8,7 @@ This service provides a high-performance, memory-efficient way to ingest massive
 - **Fast Staging:** Individual files are staged to a high-speed, RAM-backed `emptyDir` volume (`/work/tmp`) for SHA-1 hashing and deduplication.
 - **Concurrency Control:** Manages multiple concurrent uploads to Immich using `p-limit`.
 - **Backpressure:** Safely pauses the incoming stream if the upload queue is full.
-- **Native Efficiency:** Built with Node.js 24 using native `fetch`, `FormData`, and `openAsBlob` for zero-copy operations.
+- **Native Efficiency:** Built with **Bun** using native `fetch`, `FormData`, and `Bun.file` for high-performance operations.
 
 ## Deployment
 
