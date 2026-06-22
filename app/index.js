@@ -1,13 +1,8 @@
-import express from 'express';
 import { extract } from 'tar-stream';
 import pLimit from 'p-limit';
-import { createGunzip } from 'node:zlib';
-import { pipeline } from 'node:stream/promises';
-import { createWriteStream, createReadStream } from 'node:fs';
-import { unlink, mkdir } from 'node:fs/promises';
-import crypto from 'node:crypto';
 import path from 'node:path';
-import { openAsBlob } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 
 const PORT = process.env.PORT || 3000;
 const IMMICH_API_URL = process.env.IMMICH_API_URL || 'http://immich-server:2283/api/assets';
@@ -18,163 +13,194 @@ const TMP_DIR = process.env.TMP_DIR || '/work/tmp';
 const MAX_STAGED_FILES = parseInt(process.env.MAX_STAGED_FILES || '15', 10);
 const MAX_STAGED_BYTES = parseInt(process.env.MAX_STAGED_BYTES || (10 * 1024 * 1024 * 1024).toString(), 10);
 
-const app = express();
+if (MAX_STAGED_BYTES > 512 * 1024 * 1024) {
+  console.warn(`WARNING: MAX_STAGED_BYTES (${MAX_STAGED_BYTES}) is larger than the default Kubernetes emptyDir limit (512Mi). Ensure your deployment has sufficient resources.`);
+}
 
 // Ensure TMP_DIR exists
 await mkdir(TMP_DIR, { recursive: true }).catch(() => {});
 
-app.post('/upload-archive', async (req, res) => {
-  res.setHeader('Content-Type', 'application/x-ndjson');
-  res.setHeader('Transfer-Encoding', 'chunked');
+let stagedFilesCount = 0;
+let stagedFilesBytes = 0;
 
-  const log = (data) => {
-    res.write(JSON.stringify(data) + '\n');
-  };
-
-  log({ message: 'Starting archive upload processing' });
+async function handleUploadArchive(req) {
+  if (!req.body) {
+    return new Response(JSON.stringify({ error: "No body provided" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
 
   const limit = pLimit(UPLOAD_CONCURRENCY);
-  const extractor = extract();
-  const gunzip = createGunzip();
 
-  let stagedFilesCount = 0;
-  let stagedFilesBytes = 0;
+  const stream = new ReadableStream({
+    async start(controller) {
+      const log = (data) => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(data) + '\n'));
+      };
 
-  extractor.on('entry', async (header, stream, next) => {
-    if (header.type !== 'file') {
-      stream.resume();
-      return next();
-    }
+      log({ message: 'Starting archive upload processing (Bun Edition)' });
 
-    // Strict Predictive Backpressure
-    const fileSize = header.size || 0;
+      const decompressedStream = req.body.pipeThrough(new DecompressionStream("gzip"));
+      const tarReader = Readable.fromWeb(decompressedStream);
+      const extractor = extract();
 
-    const shouldWait = () => {
-      return stagedFilesCount >= MAX_STAGED_FILES ||
-             (stagedFilesBytes + fileSize) > MAX_STAGED_BYTES ||
-             limit.pendingCount >= UPLOAD_CONCURRENCY * 2;
-    };
+      extractor.on('entry', async (header, entryStream, next) => {
+        if (header.type !== 'file') {
+          entryStream.resume();
+          return next();
+        }
 
-    if (shouldWait()) {
-      log({
-        message: 'Backpressure: waiting for resources',
-        stagedCount: stagedFilesCount,
-        stagedBytes: stagedFilesBytes,
-        nextFileSize: fileSize,
-        pendingUploads: limit.pendingCount
-      });
+        const fileSize = header.size || 0;
 
-      while (shouldWait()) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
+        const shouldWait = () => {
+          return stagedFilesCount >= MAX_STAGED_FILES ||
+                 (stagedFilesBytes + fileSize) > MAX_STAGED_BYTES ||
+                 limit.pendingCount >= UPLOAD_CONCURRENCY * 2;
+        };
 
-    // Commit to staging this file
-    stagedFilesCount++;
-    stagedFilesBytes += fileSize;
+        if (shouldWait()) {
+          log({
+            message: 'Backpressure: waiting for resources',
+            stagedCount: stagedFilesCount,
+            stagedBytes: stagedFilesBytes,
+            nextFileSize: fileSize,
+            pendingUploads: limit.pendingCount
+          });
 
-    const fileExtension = path.extname(header.name);
-    const tmpFileName = `${crypto.randomUUID()}${fileExtension}`;
-    const tmpPath = path.join(TMP_DIR, tmpFileName);
+          while (shouldWait()) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
 
-    try {
-      // 1. Stage sequentially to fast emptyDir to avoid stream consumption bugs
-      await pipeline(stream, createWriteStream(tmpPath));
+        // Commit to staging this file
+        stagedFilesCount++;
+        stagedFilesBytes += fileSize;
 
-      // 2. Calculate SHA-1 hash for Immich deduplication
-      const hash = crypto.createHash('sha1');
-      await pipeline(createReadStream(tmpPath), hash);
-      const calculatedHash = hash.digest('hex');
-
-      // 3. Queue the upload concurrently
-      limit(async () => {
-        let attempt = 0;
-        const maxAttempts = 3;
+        const fileExtension = path.extname(header.name);
+        const tmpFileName = `${crypto.randomUUID()}${fileExtension}`;
+        const tmpPath = path.join(TMP_DIR, tmpFileName);
+        const fileHandle = Bun.file(tmpPath);
 
         try {
-          while (attempt < maxAttempts) {
-          attempt++;
-          try {
-            const fileBlob = await openAsBlob(tmpPath);
-            const form = new FormData();
-            form.append('assetData', fileBlob, path.basename(header.name));
-            form.append('deviceAssetId', calculatedHash);
-            form.append('deviceId', DEVICE_ID);
-            // Immich expects some extra fields sometimes, but based on docs/request:
-            // https://immich.app/docs/api/upload-asset
-            // fileReport, assetData, deviceId, deviceAssetId, fileCreatedAt, fileModifiedAt, isFavorite, duration
+          // 1. Stage sequentially to fast emptyDir to avoid stream consumption bugs
+          // Using Bun.write(tmpPath, entryStream) which supports ReadableStream/Node Stream
+          await Bun.write(tmpPath, entryStream);
 
-            const response = await fetch(IMMICH_API_URL, {
-              method: 'POST',
-              headers: {
-                'x-api-key': IMMICH_API_KEY,
-                'Accept': 'application/json',
-              },
-              body: form,
-            });
+          // 2. Calculate SHA-1 hash for Immich deduplication using streaming hasher to avoid OOM
+          const hasher = new Bun.CryptoHasher("sha1");
+          const fileStream = fileHandle.stream();
+          for await (const chunk of fileStream) {
+            hasher.update(chunk);
+          }
+          const calculatedHash = hasher.digest("hex");
 
-            if (response.ok) {
-              log({ status: 'Success', name: header.name, hash: calculatedHash });
-              break;
-            } else if (response.status === 409) {
-              log({ status: 'Graceful Duplicate Skip', name: header.name, hash: calculatedHash });
-              break;
-            } else {
-              const errorText = await response.text();
-              throw new Error(`HTTP ${response.status}: ${errorText}`);
+          // 3. Queue the upload concurrently
+          limit(async () => {
+            let attempt = 0;
+            const maxAttempts = 3;
+
+            try {
+              while (attempt < maxAttempts) {
+                attempt++;
+                try {
+                  const form = new FormData();
+                  // Bun.file() returns a Blob-like object which fetch/FormData can handle efficiently
+                  form.append('assetData', fileHandle, path.basename(header.name));
+                  form.append('deviceAssetId', calculatedHash);
+                  form.append('deviceId', DEVICE_ID);
+
+                  const response = await fetch(IMMICH_API_URL, {
+                    method: 'POST',
+                    headers: {
+                      'x-api-key': IMMICH_API_KEY,
+                      'Accept': 'application/json',
+                    },
+                    body: form,
+                  });
+
+                  if (response.ok) {
+                    log({ status: 'Success', name: header.name, hash: calculatedHash });
+                    break;
+                  } else if (response.status === 409) {
+                    log({ status: 'Graceful Duplicate Skip', name: header.name, hash: calculatedHash });
+                    break;
+                  } else {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText}`);
+                  }
+                } catch (uploadErr) {
+                  if (attempt === maxAttempts) {
+                    log({ error: 'Upload failed after retries', name: header.name, detail: uploadErr.message });
+                  } else {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    log({ message: 'Retrying upload', name: header.name, attempt, delay });
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                  }
+                }
+              }
+            } finally {
+              // ALWAYS clean up to prevent emptyDir exhaustion
+              await fileHandle.delete().catch(() => {});
+              stagedFilesCount--;
+              stagedFilesBytes -= fileSize;
             }
-          } catch (uploadErr) {
-            if (attempt === maxAttempts) {
-              log({ error: 'Upload failed after retries', name: header.name, detail: uploadErr.message });
-            } else {
-              const delay = Math.pow(2, attempt) * 1000;
-              log({ message: 'Retrying upload', name: header.name, attempt, delay });
-              await new Promise(resolve => setTimeout(resolve, delay));
-            }
-          }
-          }
-        } finally {
-          // ALWAYS clean up to prevent emptyDir exhaustion
-          await unlink(tmpPath).catch(() => {});
+          });
+
+          next();
+        } catch (err) {
+          log({ error: 'Staging failed', name: header.name, detail: err.message });
+          await fileHandle.delete().catch(() => {});
           stagedFilesCount--;
           stagedFilesBytes -= fileSize;
+          next();
         }
       });
 
-      next();
-    } catch (err) {
-      log({ error: 'Staging failed', name: header.name, detail: err.message });
-      await unlink(tmpPath).catch(() => {});
-      stagedFilesCount--;
-      stagedFilesBytes -= fileSize;
-      next();
+      try {
+        await new Promise((resolve, reject) => {
+          tarReader.pipe(extractor);
+          extractor.on('finish', resolve);
+          extractor.on('error', reject);
+          tarReader.on('error', reject);
+        });
+
+        log({ message: 'Archive fully streamed, waiting for pending uploads to finish' });
+
+        // Wait for all p-limit tasks to finish
+        while (limit.activeCount > 0 || limit.pendingCount > 0) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        log({ message: 'Processing finished' });
+        controller.close();
+      } catch (err) {
+        log({ error: 'Archive processing failed', detail: err.message });
+        controller.error(err);
+      }
     }
   });
 
-  try {
-    await pipeline(req, gunzip, extractor);
-    log({ message: 'Archive fully streamed, waiting for pending uploads to finish' });
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'application/x-ndjson',
+      'Transfer-Encoding': 'chunked',
+    }
+  });
+}
 
-    // Wait for all p-limit tasks to finish
-    await new Promise((resolve) => {
-      const check = () => {
-        if (limit.activeCount === 0 && limit.pendingCount === 0) {
-          resolve();
-        } else {
-          setTimeout(check, 100);
-        }
-      };
-      check();
+Bun.serve({
+  port: PORT,
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (req.method === 'POST' && url.pathname === '/upload-archive') {
+      return handleUploadArchive(req);
+    }
+    return new Response("Not Found", { status: 404 });
+  },
+  error(error) {
+    return new Response(JSON.stringify({ error: error.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
     });
-
-    log({ message: 'Processing finished' });
-    res.end();
-  } catch (err) {
-    log({ error: 'Archive processing failed', detail: err.message });
-    res.status(500).end();
-  }
+  },
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+console.log(`Bun server listening on port ${PORT}`);

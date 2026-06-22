@@ -1,24 +1,24 @@
-# Stage 1: Build
-FROM node:24-alpine AS builder
+# Use the official oven/bun:alpine base image
+FROM oven/bun:alpine
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Create tmp directory and set permissions for the bun user
+RUN mkdir -p /work/tmp && chown -R bun:bun /work/tmp
 
-# Stage 2: Runtime
-FROM node:24-alpine
+# Copy package.json first to leverage Docker layer caching
+COPY package.json ./
+RUN bun install --production
 
-WORKDIR /app
-
-# Create tmp directory and set permissions
-RUN mkdir -p /work/tmp && chown -R node:node /work/tmp
-
-COPY --from=builder /app/node_modules ./node_modules
+# Copy the rest of the application code
 COPY . .
 
-USER node
+# Ensure the bun user owns the app directory
+RUN chown -R bun:bun /app
+
+USER bun
 
 EXPOSE 3000
 
-CMD ["node", "index.js"]
+# Start the application using Bun
+CMD ["bun", "index.js"]

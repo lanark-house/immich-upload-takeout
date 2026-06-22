@@ -1,14 +1,13 @@
 {
   "name": "immich-takeout-streamer",
   "version": "1.0.0",
-  "description": "High-speed in-cluster tar streaming service for Immich",
+  "description": "High-speed in-cluster tar streaming service for Immich (Bun Edition)",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "bun index.js"
   },
   "dependencies": {
-    "express": "^5.2.1",
     "p-limit": "^7.3.0",
     "tar-stream": "^3.2.0"
   }
